@@ -11,15 +11,11 @@ class FedProxOptimizer(optim.SGD):
         self.mu = mu
 
     def step(self, closure=None, global_params=None):
-        # A derivada do termo proximal é: mu * (w_local - w_global)
-        if global_params is not None:
-            for p, g in zip(self.param_groups[0]['params'], global_params.parameters()):
-                if p.grad is None:
-                    continue
-                # Adiciona a penalidade direto no gradiente ANTES do passo do otimizador
-                p.grad.data.add_(p.data - g.data, alpha=self.mu)
-        
-        # Agora o SGD padrão faz: w = w - lr * gradiente_corrigido
+        if global_params is not None and self.mu != 0:
+            for p, g in zip(self.param_groups[0]['params'], global_params):
+                if p.grad is not None:
+                    # g já é um tensor detachado — sem RNG, sem grafo
+                    p.grad.data.add_(p.data - g, alpha=self.mu)
         return super().step(closure)
 
 class FedDANEOptimizer(optim.SGD):
