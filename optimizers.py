@@ -1,3 +1,4 @@
+#optimizers.py
 import torch.optim as optim
 
 class FedAvgOptimizer(optim.SGD):
@@ -14,7 +15,6 @@ class FedProxOptimizer(optim.SGD):
         if global_params is not None and self.mu != 0:
             for p, g in zip(self.param_groups[0]['params'], global_params):
                 if p.grad is not None:
-                    # g já é um tensor detachado — sem RNG, sem grafo
                     p.grad.data.add_(p.data - g, alpha=self.mu)
         return super().step(closure)
 

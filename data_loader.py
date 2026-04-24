@@ -10,7 +10,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 
-TOKEN_RE = re.compile(r"[A-Za-z0-9_']+|[^\w\s]")
+TOKEN_RE = re.compile(r"[\w']+|[.,!?;]")
 
 
 class Sent140Dataset(Dataset):
@@ -45,11 +45,6 @@ def _load_leaf_dir(split_dir: str):
 
 
 def _extract_text(sample):
-    """
-    LEAF Sent140 costuma armazenar cada x como algo parecido com:
-    [tweet_id, date, query, user, text]
-    Esta função é robusta o bastante para lidar com variantes simples.
-    """
     if isinstance(sample, str):
         return sample
 
@@ -62,9 +57,8 @@ def _extract_text(sample):
     if isinstance(sample, (list, tuple)):
         if len(sample) >= 5 and isinstance(sample[4], str):
             return sample[4]
-        # fallback: pega a última string "grande"
         for item in reversed(sample):
-            if isinstance(item, str) and len(item.strip()) > 0:
+            if isinstance(item, str) and item.strip():
                 return item
         return str(sample)
 
@@ -72,19 +66,19 @@ def _extract_text(sample):
 
 
 def _tokenize(text: str):
-    return TOKEN_RE.findall(text.lower())
+    return TOKEN_RE.findall(text)
 
 
 def _encode_label(y):
-    # Sent140 costuma usar 0 e 4
     y = int(float(y))
     return 0 if y == 0 else 1
 
 
-def _pad_or_truncate(ids, seq_len, pad_idx):
-    if len(ids) >= seq_len:
-        return ids[:seq_len]
-    return ids + [pad_idx] * (seq_len - len(ids))
+def _encode_text(text, stoi, seq_len, unk_idx):
+    tokens = _tokenize(text)
+    ids = [stoi.get(tok, unk_idx) for tok in tokens[:seq_len]]
+    ids += [unk_idx] * (seq_len - len(ids))
+    return ids
 
 
 def _load_filtered_glove(glove_path, vocab, embedding_dim=300):
@@ -101,57 +95,75 @@ def _load_filtered_glove(glove_path, vocab, embedding_dim=300):
     return glove
 
 
+def _select_users_for_paper_stats(common_users, train_users, test_users, config):
+    if len(common_users) < config.num_clients:
+        raise RuntimeError(
+            f"LEAF gerou apenas {len(common_users)} usuarios, mas o config espera {config.num_clients}."
+        )
+
+    totals = np.array(
+        [len(train_users[u]["y"]) + len(test_users[u]["y"]) for u in common_users],
+        dtype=np.int64,
+    )
+
+    if len(common_users) == config.num_clients and int(totals.sum()) == config.target_total_samples:
+        return list(common_users)
+
+    best_indices = None
+    best_gap = None
+    for seed in [config.client_selection_seed] + list(range(20000)):
+        rng = np.random.default_rng(seed)
+        indices = rng.choice(len(common_users), size=config.num_clients, replace=False)
+        total = int(totals[indices].sum())
+        gap = abs(total - config.target_total_samples)
+        if best_gap is None or gap < best_gap:
+            best_gap = gap
+            best_indices = indices
+        if gap == 0:
+            break
+
+    if best_indices is None:
+        raise RuntimeError("Falha ao selecionar usuarios do Sent140.")
+
+    return [common_users[i] for i in best_indices]
+
+
 def load_sent140_partitions(config):
     train_dir = os.path.join(config.leaf_root, "train")
     test_dir = os.path.join(config.leaf_root, "test")
 
-    print("Lendo Sent140 pré-processado pelo LEAF...")
+    print("Lendo Sent140 pre-processado pelo LEAF...")
     train_users = _load_leaf_dir(train_dir)
     test_users = _load_leaf_dir(test_dir)
 
     common_users = sorted(set(train_users.keys()) & set(test_users.keys()))
-    
-    if len(common_users) < config.num_clients:
-        raise RuntimeError(
-            f"LEAF gerou apenas {len(common_users)} usuários, mas o config espera {config.num_clients}."
-        )
-    
-    rng = np.random.default_rng(42)
-    common_users = list(rng.choice(common_users, size=config.num_clients, replace=False))
-    
+    selected_users = _select_users_for_paper_stats(common_users, train_users, test_users, config)
+
     selected_sizes = np.array(
-        [len(train_users[u]["y"]) + len(test_users[u]["y"]) for u in common_users],
-        dtype=np.int64
+        [len(train_users[u]["y"]) + len(test_users[u]["y"]) for u in selected_users],
+        dtype=np.int64,
     )
-    
     print(
-        f"[Pré-seleção Sent140] clientes={len(common_users)}, "
-        f"total={selected_sizes.sum()}, média={selected_sizes.mean():.1f}, "
-        f"std={selected_sizes.std(ddof=0):.1f}, min={selected_sizes.min()}, max={selected_sizes.max()}"
+        f"[Selecao Sent140] clientes={len(selected_users)}, total={selected_sizes.sum()}, "
+        f"media={selected_sizes.mean():.1f}, std={selected_sizes.std(ddof=0):.1f}, "
+        f"min={selected_sizes.min()}, max={selected_sizes.max()}"
     )
 
-    # constroi vocabulário a partir do treino
     token_counter = Counter()
-    total_train_samples = 0
-    total_test_samples = 0
-
-    for user in common_users:
+    for user in selected_users:
         for x in train_users[user]["x"]:
             token_counter.update(_tokenize(_extract_text(x))[: config.seq_len])
-        total_train_samples += len(train_users[user]["y"])
-        total_test_samples += len(test_users[user]["y"])
 
     pad_token = "<pad>"
     unk_token = "<unk>"
     pad_idx = 0
     unk_idx = 1
-
     vocab_tokens = sorted(token_counter.keys())
     stoi = {pad_token: pad_idx, unk_token: unk_idx}
     for tok in vocab_tokens:
         stoi[tok] = len(stoi)
 
-    print("Carregando GloVe filtrado para o vocabulário do Sent140...")
+    print("Carregando GloVe filtrado para o vocabulario do Sent140...")
     glove = _load_filtered_glove(
         glove_path=config.glove_path,
         vocab=set(vocab_tokens),
@@ -179,23 +191,19 @@ def load_sent140_partitions(config):
     global_test_sequences = []
     global_test_labels = []
     sizes = []
+    total_train_samples = 0
+    total_test_samples = 0
 
-    for client_id, user in enumerate(common_users):
+    for client_id, user in enumerate(selected_users):
         seqs_train, ys_train = [], []
         seqs_test, ys_test = [], []
 
         for x, y in zip(train_users[user]["x"], train_users[user]["y"]):
-            toks = _tokenize(_extract_text(x))
-            ids = [stoi.get(tok, unk_idx) for tok in toks]
-            ids = _pad_or_truncate(ids, config.seq_len, pad_idx)
-            seqs_train.append(ids)
+            seqs_train.append(_encode_text(_extract_text(x), stoi, config.seq_len, unk_idx))
             ys_train.append(_encode_label(y))
 
         for x, y in zip(test_users[user]["x"], test_users[user]["y"]):
-            toks = _tokenize(_extract_text(x))
-            ids = [stoi.get(tok, unk_idx) for tok in toks]
-            ids = _pad_or_truncate(ids, config.seq_len, pad_idx)
-            seqs_test.append(ids)
+            seqs_test.append(_encode_text(_extract_text(x), stoi, config.seq_len, unk_idx))
             ys_test.append(_encode_label(y))
 
         train_dataset = Sent140Dataset(seqs_train, ys_train)
@@ -207,25 +215,26 @@ def load_sent140_partitions(config):
 
         global_test_sequences.extend(seqs_test)
         global_test_labels.extend(ys_test)
+        total_train_samples += len(seqs_train)
+        total_test_samples += len(seqs_test)
         sizes.append(len(seqs_train) + len(seqs_test))
 
     test_dataset = Sent140Dataset(global_test_sequences, global_test_labels)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
-    # atualiza config para refletir exatamente o que foi carregado
     config.num_clients = len(train_loaders)
     config.clients_per_round = 10
     config.frac = config.clients_per_round / config.num_clients
 
     sizes = np.array(sizes)
-    print("[Sent140] Partição concluída.")
+    print("[Sent140] Particao concluida.")
     print(f"  Clientes: {len(train_loaders)}")
     print(f"  Total de amostras: {sizes.sum()}")
     print(
         f"  Tamanho por cliente -> min: {sizes.min()}, max: {sizes.max()}, "
-        f"média: {sizes.mean():.1f}, std: {sizes.std(ddof=0):.1f}"
+        f"media: {sizes.mean():.1f}, std: {sizes.std(ddof=0):.1f}"
     )
     print(f"  Treino total: {total_train_samples} | Teste total: {total_test_samples}")
-    print(f"  Vocabulário: {config.vocab_size} | Tokens com GloVe encontrado: {found}")
+    print(f"  Vocabulario: {config.vocab_size} | Tokens com GloVe encontrado: {found}")
 
     return train_loaders, test_loader
